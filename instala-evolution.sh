@@ -13,7 +13,7 @@ Uso: sudo bash $0 <API_DOMINIO> [--manager-dom manager.example.com] [--cert /rut
 [--allow-origins "*|https://a,https://b"] [--apikey CLAVE] [--api-port 8080] [--mgr-port 3000] \
 [--db-name evolution] [--db-user evolution] [--db-pass evolutionpass]
 Ejemplo:
-sudo bash $0 evolution.urmah.ai --manager-dom manager.urmah.ai \
+sudo bash $0 evolution.example.com --manager-dom manager.example.com \
   --cert /etc/ssl/certificados/fullchain.pem --key /etc/ssl/certificados/privkey.pem \
   --allow-origins "*" --apikey "MI_SUPER_KEY"
 USO
@@ -85,30 +85,26 @@ if [[ -z "$APIKEY" ]]; then
   APIKEY=$(cat /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 48 || true)
 fi
 
-# Normaliza allow-origins a JSON array si es lista separada por coma y no es "*"
-format_allow_origins() {
+# Normaliza allow-origins a cadena para CORS_ORIGIN (v2): coma-separado o "*"
+format_allow_origins_for_env() {
   local raw="$1"
+  # "*" -> "*"
   if [[ "$raw" == "*" ]]; then
-    echo "*"
-  elif [[ "$raw" == \[*\] ]]; then
-    echo "$raw"
-  elif [[ "$raw" == *","* ]]; then
-    # convierte a ["a","b"]
-    IFS=',' read -r -a arr <<< "$raw"
-    local out="["
-    for i in "${!arr[@]}"; do
-      dom="${arr[$i]}"
-      dom="${dom## }"; dom="${dom%% }"
-      out+=$(printf '"%s"' "$dom")
-      [[ $i -lt $((${#arr[@]}-1)) ]] && out+=","
-    done
-    out+="]"
-    echo "$out"
-  else
-    printf '"%s"' "$raw"
+    echo "*"; return
   fi
+  # ["a","b"] -> a,b (quitando comillas/espacios/corchetes)
+  if [[ "$raw" == \[*\] ]]; then
+    raw=$(echo "$raw" | sed -E 's/[\[\]"]//g' | tr -d " ")
+    echo "$raw"; return
+  fi
+  # a,b  (ya coma-separado) -> tal cual (sin espacios)
+  if [[ "$raw" == *","* ]]; then
+    echo "$raw" | tr -d " "; return
+  fi
+  # un solo origen -> tal cual
+  echo "$raw"
 }
-ALLOW_ORIGINS_FMT="$(format_allow_origins "$ALLOW_ORIGINS")"
+ALLOW_ORIGINS_ENV="$(format_allow_origins_for_env "$ALLOW_ORIGINS")"
 
 ### =================== INSTALACIÓN BASE ===================
 export DEBIAN_FRONTEND=noninteractive
@@ -149,8 +145,8 @@ AUTHENTICATION_API_KEY=${APIKEY}
 # --- Public URL (API) ---
 SERVER_URL=https://${API_DOMAIN}
 
-# --- CORS ---
-CORS_ORIGINS=${ALLOW_ORIGINS_FMT}
+# --- CORS (v2 usa CORS_ORIGIN coma-separado o "*") ---
+CORS_ORIGIN=${ALLOW_ORIGINS_ENV}
 CORS_METHODS=POST,GET,PUT,DELETE
 CORS_CREDENTIALS=true
 
@@ -301,11 +297,19 @@ systemctl reload nginx
 OK "NGINX recargado"
 
 ### =================== CHEQUEOS RÁPIDOS ===================
-STEP "9) Salud local (loopback)"
-if curl -fsS --max-time 8 "http://127.0.0.1:${API_PORT}/" | grep -qi "Evolution API"; then
-  OK "API responde en loopback ${API_PORT}"
-else
-  WARN "API no respondió en loopback. Revisa: docker compose logs evolution-api"
+STEP "9) Salud local (loopback, con reintentos)"
+TRIES=15
+OKFLAG=0
+for i in $(seq 1 $TRIES); do
+  if curl -fsS --max-time 5 "http://127.0.0.1:${API_PORT}/" | grep -qi "Evolution API"; then
+    OK "API responde en loopback ${API_PORT} (intento $i)"
+    OKFLAG=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$OKFLAG" -ne 1 ]]; then
+  WARN "API no respondió tras $((TRIES*2))s. Revisa: docker compose logs evolution-api"
 fi
 
 STEP "10) Resumen"
@@ -314,7 +318,7 @@ cat <<RESUMEN
  API URL:     https://${API_DOMAIN}
  Manager:     https://${MANAGER_DOMAIN}
  API Key:     (guardada en ${INSTALL_DIR}/.env)
- CORS:        ${ALLOW_ORIGINS_FMT}
+ CORS:        ${ALLOW_ORIGINS_ENV}
  Proyecto:    ${INSTALL_DIR}
  Contenedores:
    - evolution_api    (puerto interno 8080 -> ${API_PORT})
