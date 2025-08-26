@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# instala-evolution-robusto.sh — Evolution API v2 + Postgres + Manager (Construido Localmente) + NGINX
-# Versión final. Idempotente, validado y con solución para la generación de QR.
+# instala-evolution-produccion.sh — Evolution API v2 + Postgres + Redis + Manager (Local) + NGINX
+# Versión de Producción: Idempotente, validada y con todos los parches y mejoras descubiertos.
 #
 # ¿Qué hace este script?
 # 1. Instala Docker y NGINX.
 # 2. Clona el código fuente de Evolution Manager.
 # 3. Crea un Dockerfile funcional que corrige los problemas de construcción del Manager.
-# 4. Crea un docker-compose.yml que:
-#    - Levanta la API, la Base de Datos y el Manager construido localmente.
-#    - Configura las variables de entorno explícitamente para evitar errores de autenticación (401).
+# 4. Crea un docker-compose.yml que despliega una arquitectura completa:
+#    - API, Base de Datos (Postgres), Caché (Redis) y Manager (construido localmente).
+#    - Configura las variables de entorno explícitamente para máxima fiabilidad.
 #    - Fija la versión de WhatsApp Web para asegurar la generación del código QR.
 # 5. Configura NGINX como proxy reverso con SSL.
 # 6. Realiza chequeos de salud robustos para asegurar que todos los servicios funcionan.
@@ -129,9 +129,16 @@ CMD ["node", "lib/cli.js", "server", "start"]
 DOCKERFILE
 OK "Dockerfile para el Manager creado en ${MANAGER_SRC_DIR}/Dockerfile"
 
-STEP "3.4) Creando docker-compose.yml"
+STEP "3.4) Creando docker-compose.yml para producción"
 cat > "docker-compose.yml" <<EOF
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: evolution_redis
+    restart: always
+    volumes:
+      - evolution_redis_data:/data
+
   evolution-api:
     image: atendai/evolution-api:latest
     container_name: evolution_api
@@ -147,9 +154,13 @@ services:
       - DATABASE_PROVIDER=postgresql
       - DATABASE_CONNECTION_URI=postgresql://${DB_USER}:${DB_PASS}@evolution-db:5432/${DB_NAME}?schema=public
       - LOG_LEVEL=INFO
-      - CONFIG_SESSION_PHONE_VERSION=2.3000.1023204200 # <-- ¡NUEVO! Solución para el problema del QR.
+      - CONFIG_SESSION_PHONE_VERSION=2.3000.1023204200
+      - CACHE_ENABLED=true
+      - CACHE_PROVIDER=redis
+      - CACHE_URI=redis://evolution_redis:6379
     depends_on:
       - evolution-db
+      - redis
     volumes:
       - evolution_store:/evolution/store
       - evolution_instances:/evolution/instances
@@ -181,8 +192,9 @@ volumes:
   evolution_store:
   evolution_instances:
   evolution_pgdata:
+  evolution_redis_data:
 EOF
-OK "Archivo docker-compose.yml creado."
+OK "Archivo docker-compose.yml de producción creado."
 
 ### =================== 4. DESPLIEGUE Y CONFIGURACIÓN DE NGINX ===================
 STEP "4.1 ) Deteniendo servicios antiguos (si existen) para una instalación limpia"
@@ -244,16 +256,16 @@ OK "NGINX recargado."
 
 ### =================== 5. VALIDACIÓN Y RESUMEN ===================
 STEP "5.1) Esperando a que los contenedores se estabilicen..."
-sleep 20
+sleep 25 # Damos un poco más de tiempo por el nuevo contenedor de Redis.
 
 STEP "5.2) Verificando estado de los contenedores"
-if ! docker compose ps | grep -E 'evolution_api|evolution_db|evolution_manager' | grep 'Up'; then
+if ! docker compose ps | grep -E 'evolution_api|evolution_db|evolution_manager|evolution_redis' | grep 'Up'; then
   WARN "¡Uno o más contenedores no están en estado 'Up'!"
   docker compose ps
   docker compose logs --tail=50
   exit 1
 fi
-OK "Todos los contenedores están en estado 'Up'."
+OK "Todos los contenedores (API, DB, Redis, Manager) están en estado 'Up'."
 docker compose ps
 
 STEP "5.3) Verificando salud de la API (loopback con reintentos)"
@@ -272,23 +284,25 @@ if [[ "$OKFLAG" -ne 1 ]]; then
   WARN "La API no respondió tras $((TRIES*3))s. Revisa logs: docker compose logs evolution-api"
 fi
 
-STEP "5.4) ¡Instalación completada!"
+STEP "5.4) ¡Instalación de Producción Completada!"
 cat <<RESUMEN
 =======================================================================
-             🚀 Evolución API Desplegada con Éxito 🚀
+      🚀 Evolución API (Versión de Producción) Desplegada con Éxito 🚀
 -----------------------------------------------------------------------
  API URL:      https://${API_DOMAIN}
  Manager URL:  https://${MANAGER_DOMAIN}
  API Key:      ${APIKEY}
                (Guardada en la configuración del contenedor )
 
- Ubicaciones:
-   - Proyecto:    ${INSTALL_DIR}
-   - Cód. Manager: ${MANAGER_SRC_DIR}
+ Arquitectura:
+   - evolution_api     (API Principal)
+   - evolution_db      (Base de Datos PostgreSQL)
+   - evolution_redis   (Caché en Memoria)
+   - evolution_manager (Interfaz Gráfica, construida localmente)
 
  ¿Qué hacer ahora?
  1. Abre https://${MANAGER_DOMAIN} en tu navegador.
- 2. Deberías poder crear una instancia y escanear el código QR.
+ 2. Deberías poder crear una instancia y escanear el código QR sin problemas.
  3. Si tienes algún problema, limpia la caché de tu navegador (Ctrl+F5 ).
 =======================================================================
 RESUMEN
