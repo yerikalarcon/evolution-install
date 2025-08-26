@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # instala-evolution-robusto.sh — Evolution API v2 + Postgres + Manager (Construido Localmente) + NGINX
-# Versión mejorada tras una intensa depuración. Idempotente y validado.
+# Versión final. Idempotente, validado y con solución para la generación de QR.
 #
 # ¿Qué hace este script?
 # 1. Instala Docker y NGINX.
-# 2. Clona el código fuente de Evolution Manager (ya que las imágenes públicas están rotas).
+# 2. Clona el código fuente de Evolution Manager.
 # 3. Crea un Dockerfile funcional que corrige los problemas de construcción del Manager.
 # 4. Crea un docker-compose.yml que:
-#    - Levanta la API y la Base de Datos.
-#    - Construye la imagen del Manager localmente.
-#    - Configura las variables de entorno explícitamente para evitar errores de autenticación.
+#    - Levanta la API, la Base de Datos y el Manager construido localmente.
+#    - Configura las variables de entorno explícitamente para evitar errores de autenticación (401).
+#    - Fija la versión de WhatsApp Web para asegurar la generación del código QR.
 # 5. Configura NGINX como proxy reverso con SSL.
 # 6. Realiza chequeos de salud robustos para asegurar que todos los servicios funcionan.
 
@@ -69,7 +69,6 @@ KEY_PATH="$(_pick_first_existing  "${_try_paths_key[@]}")"
 [[ -n "$KEY_PATH"  && -f "$KEY_PATH"  ]] || { echo "[ERROR] No se encontró clave privada privkey.pem. Usa --key."; exit 1; }
 
 # --- Generación de API Key ---
-# Usamos 'head -c 48' para asegurar la longitud correcta.
 APIKEY=$(head /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 48)
 
 ### =================== 2. INSTALACIÓN DE DEPENDENCIAS ===================
@@ -111,7 +110,6 @@ mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
 STEP "3.2) Clonando el código fuente de Evolution Manager en $MANAGER_SRC_DIR"
-# Esto es crucial porque las imágenes públicas están rotas.
 if [ -d "$MANAGER_SRC_DIR" ]; then
   OK "El directorio del Manager ya existe. Omitiendo clonación."
 else
@@ -120,39 +118,18 @@ else
 fi
 
 STEP "3.3 ) Creando el Dockerfile corregido para el Manager"
-# Este Dockerfile soluciona los problemas de construcción:
-# - Añade el enlace simbólico para node (corrige error de PATH).
-# - Copia los archivos ANTES de `npm install` (corrige error de postinstall.js).
 cat > "${MANAGER_SRC_DIR}/Dockerfile" <<'DOCKERFILE'
-# Usar una imagen de Node.js 20.
 FROM node:20
-
-# Establecer el directorio de trabajo
 WORKDIR /usr/src/app
-
-# --- LA SOLUCIÓN CLAVE ---
-# Crear un enlace simbólico para que 'node' sea encontrado por los scripts.
-# Esto soluciona el error "/usr/bin/env: 'node': No such file or directory".
 RUN ln -s /usr/local/bin/node /usr/bin/node
-
-# Copiar TODOS los archivos del proyecto.
 COPY . .
-
-# Instalar las dependencias de producción.
 RUN npm install --omit=dev
-
-# Exponer el puerto que la aplicación necesita.
 EXPOSE 3000
-
-# El comando para iniciar la aplicación.
 CMD ["node", "lib/cli.js", "server", "start"]
 DOCKERFILE
 OK "Dockerfile para el Manager creado en ${MANAGER_SRC_DIR}/Dockerfile"
 
 STEP "3.4) Creando docker-compose.yml"
-# Este docker-compose.yml es la versión definitiva:
-# - Construye el manager desde la fuente local.
-# - Fija las variables de entorno de la API para evitar errores de autenticación.
 cat > "docker-compose.yml" <<EOF
 services:
   evolution-api:
@@ -170,6 +147,7 @@ services:
       - DATABASE_PROVIDER=postgresql
       - DATABASE_CONNECTION_URI=postgresql://${DB_USER}:${DB_PASS}@evolution-db:5432/${DB_NAME}?schema=public
       - LOG_LEVEL=INFO
+      - CONFIG_SESSION_PHONE_VERSION=2.3000.1023204200 # <-- ¡NUEVO! Solución para el problema del QR.
     depends_on:
       - evolution-db
     volumes:
@@ -189,7 +167,6 @@ services:
 
   evolution-manager:
     container_name: evolution_manager
-    # Construye la imagen desde la fuente local en lugar de descargarla.
     build: ${MANAGER_SRC_DIR}
     restart: always
     environment:
@@ -209,12 +186,9 @@ OK "Archivo docker-compose.yml creado."
 
 ### =================== 4. DESPLIEGUE Y CONFIGURACIÓN DE NGINX ===================
 STEP "4.1 ) Deteniendo servicios antiguos (si existen) para una instalación limpia"
-# El --remove-orphans es por si se cambió algo en el compose.
 docker compose down --remove-orphans || true
 
 STEP "4.2) Construyendo imagen del Manager y levantando contenedores"
-# El flag --build es crucial para construir la imagen del manager.
-# Esto puede tardar varios minutos la primera vez.
 docker compose up -d --build
 
 STEP "4.3) Configurando NGINX vhost para API (${API_DOMAIN})"
@@ -270,7 +244,7 @@ OK "NGINX recargado."
 
 ### =================== 5. VALIDACIÓN Y RESUMEN ===================
 STEP "5.1) Esperando a que los contenedores se estabilicen..."
-sleep 20 # Tiempo de gracia generoso para que todos los servicios inicien.
+sleep 20
 
 STEP "5.2) Verificando estado de los contenedores"
 if ! docker compose ps | grep -E 'evolution_api|evolution_db|evolution_manager' | grep 'Up'; then
@@ -314,7 +288,7 @@ cat <<RESUMEN
 
  ¿Qué hacer ahora?
  1. Abre https://${MANAGER_DOMAIN} en tu navegador.
- 2. Si ves la interfaz de login, ¡todo funciona!
- 3. Si no carga, prueba a limpiar la caché de tu navegador (Ctrl+F5 ).
+ 2. Deberías poder crear una instancia y escanear el código QR.
+ 3. Si tienes algún problema, limpia la caché de tu navegador (Ctrl+F5 ).
 =======================================================================
 RESUMEN
